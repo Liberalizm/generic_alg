@@ -108,7 +108,7 @@ class NeuralNetworkInterface:
                    (positions, velocities, angles, etc.)
 
         Returns:
-            List of activation values (0.0 to 1.0) for each muscle
+            List of activation values (-1.0 to 1.0) for each muscle
         """
         # Placeholder - return zeros (no activation)
         # Override this method to implement your neural network
@@ -194,6 +194,10 @@ class Muscle:
         # Positive: contracting, Negative: extended (resisting)
         self.activation = 0.0
 
+        # Telemetry for UI/debugging
+        self.last_force = 0.0   # absolute force magnitude along line of action (N)
+        self.last_power = 0.0   # non-negative mechanical power from activation component (W, arbitrary units)
+
     def get_world_anchors(self):
         """Get world coordinates of muscle attachment points."""
         anchor_a = self.body_a.GetWorldPoint(self.local_anchor_a)
@@ -254,9 +258,18 @@ class Muscle:
         dir_x = dx / distance
         dir_y = dy / distance
 
-        # Calculate effective force (scaled by energy and activation)
+        # Calculate effective force components
         effective_max_force = self.get_effective_max_force()
-        force_magnitude = effective_max_force * self.activation + (distance - self.rest_length) * self.spring_stiffness
+        activation_force = effective_max_force * self.activation
+
+        # Spring force pulls back toward rest length (if defined)
+        if self.rest_length is not None:
+            spring_force = (distance - self.rest_length) * self.spring_stiffness
+        else:
+            spring_force = 0.0
+
+        # Total force magnitude along the line A->B
+        force_magnitude = activation_force + spring_force
 
         # print(f"Muscle apply_force={force_magnitude} activation={self.activation:.2f}, distance={distance:.2f}, effective_max_force={effective_max_force:.2f}, rest_length={self.rest_length:.2f}, spring_stiffness={self.spring_stiffness:.2f}")
         # Determine force direction based on activation sign
@@ -268,9 +281,21 @@ class Muscle:
         self.body_a.ApplyForce((force_x, force_y), anchor_a, wake=True)
         self.body_b.ApplyForce((-force_x, -force_y), anchor_b, wake=True)
 
-        # Calculate energy cost based on work done
-        energy_cost = force_magnitude * abs(self.activation) * self.energy_cost_factor * dt
-        self.energy = max(0.0, self.energy - energy_cost)
+        # Calculate energy cost based on mechanical work from the activation component only
+        # Power ~ |F_activation| * |relative_speed_along_line|
+        va = self.body_a.GetLinearVelocityFromWorldPoint(anchor_a)
+        vb = self.body_b.GetLinearVelocityFromWorldPoint(anchor_b)
+        rel_vx = vb.x - va.x
+        rel_vy = vb.y - va.y
+        rel_speed_along = abs(rel_vx * dir_x + rel_vy * dir_y)
+
+        power_activation = abs(activation_force) * rel_speed_along
+        # Telemetry outputs
+        self.last_force = abs(force_magnitude)
+        self.last_power = power_activation
+        energy_cost = power_activation * self.energy_cost_factor * dt
+        # Clamp energy within [0, max_energy]
+        self.energy = max(0.0, min(self.max_energy, self.energy - energy_cost))
 
     def regenerate_energy(self, dt: float):
         """Regenerate energy at a constant rate."""
@@ -281,7 +306,7 @@ class Muscle:
         Main update method to be called each simulation step.
 
         Args:
-            activation: Neural network output (0.0 to 1.0)
+            activation: Neural network output (-1.0 to 1.0)
             dt: Time step in seconds
         """
         #print("Update fun is triggered")
@@ -528,12 +553,12 @@ class Cat:
             body_b=upper,
             local_anchor_a=(0, 0),  # Point on torso near this leg's hip
             local_anchor_b=(-x_off, -self.upper_len * 0.3),  # Lower part of upper leg
-            max_force=800.0 * self.scale,
-            max_energy=100.0,
+            max_force=480.0 * self.scale,
+            max_energy=10000.0,
             energy_regen_rate=20.0,
             energy_cost_factor=0.03,
-            rest_length= math.sqrt(-x_off ** 2 + (-self.upper_len * 0.3) ** 2) * 0.8,
-            spring_stiffness=5.0 * self.scale,  # Strong spring to hold position
+            rest_length=(self.upper_len * 0.1 + self.lower_len * 0.1) * 5.5,
+            spring_stiffness=100.0 * self.scale,  # Strong spring to hold position
         )
         self.muscles.append(hip_muscle)
 
@@ -544,12 +569,12 @@ class Cat:
             body_b=lower,
             local_anchor_a=(x_off, self.upper_len * 0.1),  # Lower part of upper leg
             local_anchor_b=(x_off, -self.lower_len * 0.1),   # Upper part of lower leg
-            max_force=600.0 * self.scale,
-            max_energy=100.0,
+            max_force=360.0 * self.scale,
+            max_energy=10000.0,
             energy_regen_rate=20.0,
             energy_cost_factor=0.03,
-            rest_length= (self.upper_len * 0.1 + self.lower_len * 0.1) * 0.8,
-            spring_stiffness=4.0 * self.scale,  # Strong spring to hold position
+            rest_length= (self.upper_len * 0.1 + self.lower_len * 0.1) * 4,
+            spring_stiffness=80.0 * self.scale,  # Strong spring to hold position
         )
         self.muscles.append(knee_muscle)
 

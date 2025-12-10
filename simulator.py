@@ -13,6 +13,7 @@ import time
 import queue as _queue
 #
 from ga_network import EvoNeuralController as SimpleNeuralNetwork
+# from test_sim import LegExtensionTestController as SimpleNeuralNetwork
 from ga_network import EvolutionaryAlgorithm, fitness_distance_speed
 from cat import Cat
 from typing import Any
@@ -63,16 +64,20 @@ ITERATION_TIME = 10
 # 83-114: muscle_data (8 muscles * 4 values: ax, ay, bx, by) = 32
 # 115-122: muscle_activations (8)
 # 123-130: muscle_energies (8)
-# 131: distance, 132: speed
-# 133: net_layer_count
-# 134-139: net_layer_sizes (max 6)
-# 140-235: net_activations (max_layers 6 * max_nodes 16 = 96)
+# 131-138: muscle_forces (8)
+# 139-146: muscle_powers (8)
+# 147: distance, 148: speed
+# 149: net_layer_count
+# 150-155: net_layer_sizes (max 6)
+# 156-251: net_activations (max_layers 6 * max_nodes 16 = 96)
 
 # Visualization/serialization caps for network snapshot
 NET_MAX_LAYERS = 6
 NET_MAX_NODES = 16
 
-CAT_DATA_SIZE = 140 + 1 + NET_MAX_LAYERS + (NET_MAX_LAYERS * NET_MAX_NODES)
+# Total floats reserved per cat block:
+# start of net_activations (156) + NET_MAX_LAYERS * NET_MAX_NODES (96) = 252
+CAT_DATA_SIZE = 156 + (NET_MAX_LAYERS * NET_MAX_NODES)
 
 
 def simulation_worker(core_id: int, num_cats: int, shared_data: Array,
@@ -163,13 +168,15 @@ def simulation_worker(core_id: int, num_cats: int, shared_data: Array,
         if elapsed >= dt:
             last_time = current_time
 
-            # Step physics
-            world.Step(dt, 8, 3)
-
-            # Update cats and write to shared memory
-            for i, cat in enumerate(cats):
+            # Apply muscle forces BEFORE stepping physics so they affect this frame
+            for cat in cats:
                 cat.update(dt)
 
+            # Step physics (integrate applied forces)
+            world.Step(dt, 8, 3)
+
+            # Write updated state to shared memory
+            for i, cat in enumerate(cats):
                 global_idx = core_id * num_cats + i
                 offset = global_idx * CAT_DATA_SIZE
 
@@ -221,13 +228,37 @@ def simulation_worker(core_id: int, num_cats: int, shared_data: Array,
                     shared_data[idx] = muscle.get_energy_percent()
                     idx += 1
 
+                # Muscle command force (ans = activation * effective_max_force)
+                idx = offset + 131
+                for muscle in cat.muscles:
+                    try:
+                        # Display requested value: activation * max applied (effective) force
+                        eff_max = 0.0
+                        try:
+                            eff_max = float(muscle.get_effective_max_force())
+                        except Exception:
+                            eff_max = 0.0
+                        shared_data[idx] = float(muscle.activation) * eff_max
+                    except Exception:
+                        shared_data[idx] = 0.0
+                    idx += 1
+
+                # Muscle powers (mechanical power from activation component)
+                idx = offset + 139
+                for muscle in cat.muscles:
+                    try:
+                        shared_data[idx] = float(getattr(muscle, 'last_power', 0.0))
+                    except Exception:
+                        shared_data[idx] = 0.0
+                    idx += 1
+
                 # Stats
-                shared_data[offset + 131] = cat.stats.get_distance_from_spawn(cat.get_position().x)
+                shared_data[offset + 147] = cat.stats.get_distance_from_spawn(cat.get_position().x)
                 # Store max speed achieved this episode for fitness evaluation
-                shared_data[offset + 132] = cat.stats.get_max_speed()
+                shared_data[offset + 148] = cat.stats.get_max_speed()
 
                 # Network snapshot (layers and node values)
-                net_base = offset + 133
+                net_base = offset + 149
                 # Default clear
                 shared_data[net_base + 0] = 0  # layer count
                 # Zero sizes
@@ -256,6 +287,8 @@ def simulation_worker(core_id: int, num_cats: int, shared_data: Array,
                                 v = 1.0
                             stretches[mi] = v
 
+                        # Append static node = 1.0 to match controller input
+                        stretches.append(1.0)
                         layers = nn.mlp.forward_layers(stretches)
                         # Cap number of layers
                         L = min(len(layers), NET_MAX_LAYERS)
@@ -287,8 +320,8 @@ def read_cat_data(shared_data: Array, cat_idx: int) -> dict:
         'leg_data': [],
         'muscle_data': [],
         'muscle_energies': [],
-        'distance': shared_data[offset + 131],
-        'speed': shared_data[offset + 132],
+        'distance': shared_data[offset + 147],
+        'speed': shared_data[offset + 148],
         'net': {
             'layer_count': 0,
             'sizes': [],
@@ -319,14 +352,20 @@ def read_cat_data(shared_data: Array, cat_idx: int) -> dict:
     # Muscle data
     idx = offset + 83
     act_idx = offset + 115
+    force_idx = offset + 131
+    power_idx = offset + 139
     for _ in range(8):
         data['muscle_data'].append({
             'anchor_a': (shared_data[idx], shared_data[idx + 1]),
             'anchor_b': (shared_data[idx + 2], shared_data[idx + 3]),
             'activation': shared_data[act_idx],
+            'force': shared_data[force_idx],
+            'power': shared_data[power_idx],
         })
         idx += 4
         act_idx += 1
+        force_idx += 1
+        power_idx += 1
 
     # Muscle energies
     idx = offset + 123
@@ -335,7 +374,7 @@ def read_cat_data(shared_data: Array, cat_idx: int) -> dict:
         idx += 1
 
     # Network snapshot
-    net_base = offset + 133
+    net_base = offset + 149
     L = int(shared_data[net_base + 0])
     L = max(0, min(L, NET_MAX_LAYERS))
     sizes: List[int] = []
@@ -380,8 +419,11 @@ def draw_cat_from_render_data(surface, render_data: dict, camera_x):
     for muscle_info in render_data['muscle_data']:
         pos_a = world_to_screen(muscle_info['anchor_a'][0], muscle_info['anchor_a'][1], camera_x)
         pos_b = world_to_screen(muscle_info['anchor_b'][0], muscle_info['anchor_b'][1], camera_x)
-        intensity = int(100 + 155 * muscle_info['activation'])
-        thickness = max(2, int(4 * muscle_info['activation']))
+        a = muscle_info.get('activation', 0.0)
+        # Clamp for visualization (activation range may be [-1, 1])
+        a_clamped = max(0.0, min(1.0, float(a)))
+        intensity = int(100 + 155 * a_clamped)
+        thickness = max(2, int(4 * a_clamped))
         pygame.draw.line(surface, (5, 50, 50), pos_a, pos_b, thickness)
 
 
@@ -696,7 +738,8 @@ def main():
         if ea is None:
             try:
                 num_muscles = len(all_cats[0]['muscle_data']) if NUM_CATS > 0 else 8
-                ea = EvolutionaryAlgorithm(input_size=num_muscles, output_size=num_muscles, pop_size=NUM_CATS)
+                # Include static input node (constant 1.0) in genomes
+                ea = EvolutionaryAlgorithm(input_size=num_muscles + 1, output_size=num_muscles, pop_size=NUM_CATS)
                 # Send initial random population to workers
                 send_population_to_workers([g.clone() for g in ea.population])
             except Exception:
@@ -714,7 +757,9 @@ def main():
 
         for i, muscle in enumerate(best_cat['muscle_data']):
             if i < len(force_histories):
-                force_histories[i].append(muscle['activation'] * 1000)  # Approximate force
+                # Use measured force from simulation if available
+                force_val = float(muscle.get('force', 0.0))
+                force_histories[i].append(max(0.0, force_val))
 
         camera_x = best_cat['body_position'][0]
 
@@ -765,7 +810,8 @@ def main():
             draw_iteration_info(screen, iteration, iteration_time, ITERATION_TIME)
             draw_parallel_info(screen)
 
-            total_power = sum(m['activation'] * 1000 for m in best_cat['muscle_data'])
+            # Use measured mechanical power from muscles
+            total_power = sum(float(m.get('power', 0.0)) for m in best_cat['muscle_data'])
             draw_best_cat_info(screen, best_cat['distance'], best_cat['speed'], total_power)
             draw_muscle_energy_sliders(screen, best_cat['muscle_energies'], SCREEN_WIDTH - 260, 20)
             draw_force_graph(screen, force_histories, SCREEN_WIDTH - 270, 200, force_max_samples)
