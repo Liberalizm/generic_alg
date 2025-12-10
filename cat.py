@@ -529,7 +529,7 @@ class Cat:
             local_anchor_a=(0, 0),  # Point on torso near this leg's hip
             local_anchor_b=(-x_off, -self.upper_len * 0.3),  # Lower part of upper leg
             max_force=800.0 * self.scale,
-            max_energy=10.0,
+            max_energy=100.0,
             energy_regen_rate=20.0,
             energy_cost_factor=0.03,
             rest_length= math.sqrt(-x_off ** 2 + (-self.upper_len * 0.3) ** 2) * 0.8,
@@ -545,7 +545,7 @@ class Cat:
             local_anchor_a=(x_off, self.upper_len * 0.1),  # Lower part of upper leg
             local_anchor_b=(x_off, -self.lower_len * 0.1),   # Upper part of lower leg
             max_force=600.0 * self.scale,
-            max_energy=10.0,
+            max_energy=100.0,
             energy_regen_rate=20.0,
             energy_cost_factor=0.03,
             rest_length= (self.upper_len * 0.1 + self.lower_len * 0.1) * 0.8,
