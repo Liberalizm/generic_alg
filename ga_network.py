@@ -110,15 +110,33 @@ class Genome:
         cut = random.randint(0, min(len(self.hidden_layers), len(other.hidden_layers)))
         new_hidden = self.hidden_layers[:cut] + other.hidden_layers[cut:]
         child = Genome(self.input_size, self.output_size, new_hidden)
+        # Blend parameters while keeping child parameter vector sizes consistent with its architecture
         for i in range(len(child.weight_genes)):
-            a = self.weight_genes[i].values if i < len(self.weight_genes) else child.weight_genes[i].values
-            b = other.weight_genes[i].values if i < len(other.weight_genes) else child.weight_genes[i].values
             alpha = 0.5
-            child.weight_genes[i].values = [alpha * av + (1 - alpha) * bv for av, bv in zip(a, b)]
+            Wc = child.weight_genes[i]
+            Bc = child.bias_genes[i]
 
-            a_b = self.bias_genes[i].values if i < len(self.bias_genes) else child.bias_genes[i].values
-            b_b = other.bias_genes[i].values if i < len(other.bias_genes) else child.bias_genes[i].values
-            child.bias_genes[i].values = [alpha * av + (1 - alpha) * bv for av, bv in zip(a_b, b_b)]
+            # Parents' genes for this layer if present
+            Wa = self.weight_genes[i] if i < len(self.weight_genes) else None
+            Wb = other.weight_genes[i] if i < len(other.weight_genes) else None
+            Ba = self.bias_genes[i] if i < len(self.bias_genes) else None
+            Bb = other.bias_genes[i] if i < len(other.bias_genes) else None
+
+            # Blend overlapping region of weights
+            max_r = min(Wc.rows, Wa.rows if Wa else 0, Wb.rows if Wb else 0)
+            max_c = min(Wc.cols, Wa.cols if Wa else 0, Wb.cols if Wb else 0)
+            for r in range(max_r):
+                for c in range(max_c):
+                    av = Wa.get(r, c) if Wa else Wc.get(r, c)
+                    bv = Wb.get(r, c) if Wb else Wc.get(r, c)
+                    Wc.set(r, c, alpha * av + (1 - alpha) * bv)
+
+            # Blend overlapping region of biases
+            max_b = min(Bc.size, len(Ba.values) if Ba else 0, len(Bb.values) if Bb else 0)
+            for j in range(max_b):
+                av = Ba.values[j] if Ba else Bc.values[j]
+                bv = Bb.values[j] if Bb else Bc.values[j]
+                Bc.values[j] = alpha * av + (1 - alpha) * bv
         return child
 
     def _rebuild_params(self):
@@ -242,7 +260,7 @@ def fitness_distance_speed(distance_traveled: float,
     Returns:
         A scalar fitness value.
     """
-    return distance_weight * float(distance_traveled) + speed_weight * float(max_speed)
+    return (distance_weight * float(distance_traveled) + speed_weight * float(max_speed))
 
 
 class EvolutionaryAlgorithm:

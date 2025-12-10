@@ -50,11 +50,11 @@ MUSCLE_NAMES = [
 ]
 
 # Parallel simulation settings
-NUM_CORES = 5          # Number of CPU cores to use
-CATS_PER_CORE = 3      # Number of cats simulated on each core
+NUM_CORES = 20          # Number of CPU cores to use
+CATS_PER_CORE = 1      # Number of cats simulated on each core
 NUM_CATS = NUM_CORES * CATS_PER_CORE
 
-ITERATION_TIME = 4
+ITERATION_TIME = 10
 
 # Shared memory layout per cat (floats):
 # 0: body_x, 1: body_y, 2: body_angle
@@ -96,11 +96,33 @@ def simulation_worker(core_id: int, num_cats: int, shared_data: Array,
     def create_cats():
         nonlocal cats
         nonlocal current_genomes
-        for cat in cats:
-            world.DestroyBody(cat.body)
-            for leg in cat.legs:
-                world.DestroyBody(leg['upper'])
-                world.DestroyBody(leg['lower'])
+        # Clear existing cats: destroy physics objects and zero shared memory
+        for i, cat in enumerate(cats):
+            try:
+                cat.destroy()
+            except Exception:
+                # Fallback in case old Cat lacks destroy()
+                try:
+                    world.DestroyBody(cat.body)
+                    for leg in cat.legs:
+                        try:
+                            world.DestroyBody(leg.get('upper'))
+                        except Exception:
+                            pass
+                        try:
+                            world.DestroyBody(leg.get('lower'))
+                        except Exception:
+                            pass
+                except Exception:
+                    pass
+            # Zero this cat's shared memory block to prevent ghost rendering
+            try:
+                global_idx = core_id * num_cats + i
+                offset = global_idx * CAT_DATA_SIZE
+                for k in range(CAT_DATA_SIZE):
+                    shared_data[offset + k] = 0.0
+            except Exception:
+                pass
         cats.clear()
 
         for i in range(num_cats):
@@ -201,7 +223,8 @@ def simulation_worker(core_id: int, num_cats: int, shared_data: Array,
 
                 # Stats
                 shared_data[offset + 131] = cat.stats.get_distance_from_spawn(cat.get_position().x)
-                shared_data[offset + 132] = cat.stats.get_current_speed()
+                # Store max speed achieved this episode for fitness evaluation
+                shared_data[offset + 132] = cat.stats.get_max_speed()
 
                 # Network snapshot (layers and node values)
                 net_base = offset + 133
@@ -704,7 +727,7 @@ def main():
                     s = all_cats[i]['speed']
                     ea.fitness[i] = fitness_distance_speed(d, s)
                 # Save best every 20 generations
-                if iteration % 3 == 0:
+                if iteration % 20 == 0:
                     try:
                         ea._save_best(iteration)
                     except Exception:

@@ -528,7 +528,7 @@ class Cat:
             body_b=upper,
             local_anchor_a=(0, 0),  # Point on torso near this leg's hip
             local_anchor_b=(-x_off, -self.upper_len * 0.3),  # Lower part of upper leg
-            max_force=240.0 * self.scale,
+            max_force=800.0 * self.scale,
             max_energy=10.0,
             energy_regen_rate=20.0,
             energy_cost_factor=0.03,
@@ -544,7 +544,7 @@ class Cat:
             body_b=lower,
             local_anchor_a=(x_off, self.upper_len * 0.1),  # Lower part of upper leg
             local_anchor_b=(x_off, -self.lower_len * 0.1),   # Upper part of lower leg
-            max_force=180.0 * self.scale,
+            max_force=600.0 * self.scale,
             max_energy=10.0,
             energy_regen_rate=20.0,
             energy_cost_factor=0.03,
@@ -595,3 +595,53 @@ class Cat:
 
     def get_angle(self):
         return self.body.angle
+
+    def destroy(self):
+        """Safely destroy all Box2D objects belonging to this cat.
+
+        Box2D will normally destroy joints when their bodies are destroyed,
+        but we explicitly destroy joints first for clarity and to avoid any
+        potential dangling references in our own structures.
+        """
+        try:
+            # Destroy joints first
+            for leg in getattr(self, 'legs', []) or []:
+                hip = leg.get('hip')
+                knee = leg.get('knee')
+                if hip is not None:
+                    try:
+                        self.world.DestroyJoint(hip)
+                    except Exception:
+                        pass
+                if knee is not None:
+                    try:
+                        self.world.DestroyJoint(knee)
+                    except Exception:
+                        pass
+
+            # Destroy leg bodies
+            for leg in getattr(self, 'legs', []) or []:
+                upper = leg.get('upper')
+                lower = leg.get('lower')
+                if upper is not None:
+                    try:
+                        self.world.DestroyBody(upper)
+                    except Exception:
+                        pass
+                if lower is not None:
+                    try:
+                        self.world.DestroyBody(lower)
+                    except Exception:
+                        pass
+
+            # Destroy torso/body last
+            if getattr(self, 'body', None) is not None:
+                try:
+                    self.world.DestroyBody(self.body)
+                except Exception:
+                    pass
+        finally:
+            # Clear references to help GC and avoid re-use
+            self.legs = []
+            self.muscles = []
+            self.nn_interface = None
