@@ -1,4 +1,5 @@
 import pygame
+import os
 import Box2D
 from Box2D import b2World
 import math
@@ -6,13 +7,15 @@ import random
 import collections
 from typing import List, Dict, Optional
 import multiprocessing as mp
-from multiprocessing import Process, Array, Value
+from multiprocessing import Process, Array, Value, Queue
 import ctypes
 import time
+import queue as _queue
 #
-# from nn import SimpleNeuralNetwork
-from test_sim import LegExtensionTestController as SimpleNeuralNetwork
+from ga_network import EvoNeuralController as SimpleNeuralNetwork
+from ga_network import EvolutionaryAlgorithm, fitness_distance_speed
 from cat import Cat
+from typing import Any
 
 # Screen settings
 SCREEN_WIDTH = 1200
@@ -47,11 +50,11 @@ MUSCLE_NAMES = [
 ]
 
 # Parallel simulation settings
-NUM_CORES = 20          # Number of CPU cores to use
-CATS_PER_CORE = 2      # Number of cats simulated on each core
+NUM_CORES = 5          # Number of CPU cores to use
+CATS_PER_CORE = 3      # Number of cats simulated on each core
 NUM_CATS = NUM_CORES * CATS_PER_CORE
 
-ITERATION_TIME = 15.0
+ITERATION_TIME = 4
 
 # Shared memory layout per cat (floats):
 # 0: body_x, 1: body_y, 2: body_angle
@@ -61,12 +64,21 @@ ITERATION_TIME = 15.0
 # 115-122: muscle_activations (8)
 # 123-130: muscle_energies (8)
 # 131: distance, 132: speed
-CAT_DATA_SIZE = 140
+# 133: net_layer_count
+# 134-139: net_layer_sizes (max 6)
+# 140-235: net_activations (max_layers 6 * max_nodes 16 = 96)
+
+# Visualization/serialization caps for network snapshot
+NET_MAX_LAYERS = 6
+NET_MAX_NODES = 16
+
+CAT_DATA_SIZE = 140 + 1 + NET_MAX_LAYERS + (NET_MAX_LAYERS * NET_MAX_NODES)
 
 
 def simulation_worker(core_id: int, num_cats: int, shared_data: Array,
                       running_flag: Value, reset_flag: Value,
-                      spawn_x: float, ground_y: float):
+                      spawn_x: float, ground_y: float,
+                      genomes_queue: Queue):
     """Worker process running continuous simulation."""
 
     world = b2World(gravity=(0, -10), doSleep=True)
@@ -79,9 +91,11 @@ def simulation_worker(core_id: int, num_cats: int, shared_data: Array,
     )
 
     cats: List[Cat] = []
+    current_genomes = None  # type: Optional[List[Any]]
 
     def create_cats():
         nonlocal cats
+        nonlocal current_genomes
         for cat in cats:
             world.DestroyBody(cat.body)
             for leg in cat.legs:
@@ -92,7 +106,11 @@ def simulation_worker(core_id: int, num_cats: int, shared_data: Array,
         for i in range(num_cats):
             # Use local index for collision filtering within this worker's world
             cat = Cat(world, position=(spawn_x, ground_y + 15), cat_index=i)
-            nn = SimpleNeuralNetwork(num_muscles=len(cat.muscles))
+            # If genomes were provided, attach them; else create default controller
+            if current_genomes and i < len(current_genomes) and current_genomes[i] is not None:
+                nn = SimpleNeuralNetwork(num_muscles=len(cat.muscles), genome=current_genomes[i])
+            else:
+                nn = SimpleNeuralNetwork(num_muscles=len(cat.muscles))
             cat.set_neural_network(nn)
             cats.append(cat)
 
@@ -102,6 +120,15 @@ def simulation_worker(core_id: int, num_cats: int, shared_data: Array,
     last_time = time.time()
 
     while running_flag.value:
+        # Non-blocking check for incoming genomes to apply on next reset
+        try:
+            while True:
+                batch = genomes_queue.get_nowait()
+                # keep the latest batch only
+                current_genomes = batch
+        except _queue.Empty:
+            pass
+
         # Check reset flag
         if reset_flag.value:
             create_cats()
@@ -175,6 +202,53 @@ def simulation_worker(core_id: int, num_cats: int, shared_data: Array,
                 # Stats
                 shared_data[offset + 131] = cat.stats.get_distance_from_spawn(cat.get_position().x)
                 shared_data[offset + 132] = cat.stats.get_current_speed()
+
+                # Network snapshot (layers and node values)
+                net_base = offset + 133
+                # Default clear
+                shared_data[net_base + 0] = 0  # layer count
+                # Zero sizes
+                for k in range(NET_MAX_LAYERS):
+                    shared_data[net_base + 1 + k] = 0
+                # Zero activations
+                act_base = net_base + 1 + NET_MAX_LAYERS
+                for k in range(NET_MAX_LAYERS * NET_MAX_NODES):
+                    shared_data[act_base + k] = 0.0
+
+                nn = getattr(cat, 'nn_interface', None)
+                try:
+                    # Build stretches input like EvoNeuralController
+                    if nn is not None and hasattr(nn, 'mlp') and hasattr(nn, 'genome'):
+                        stretches = [1.0] * len(cat.muscles)
+                        for mi, muscle in enumerate(cat.muscles):
+                            st = 1.0
+                            try:
+                                st = muscle.get_stretch_ratio()
+                            except Exception:
+                                pass
+                            v = st - 1.0
+                            if v < -1.0:
+                                v = -1.0
+                            elif v > 1.0:
+                                v = 1.0
+                            stretches[mi] = v
+
+                        layers = nn.mlp.forward_layers(stretches)
+                        # Cap number of layers
+                        L = min(len(layers), NET_MAX_LAYERS)
+                        shared_data[net_base + 0] = float(L)
+                        # Write sizes and activations
+                        for li in range(L):
+                            layer_vals = layers[li]
+                            size = min(len(layer_vals), NET_MAX_NODES)
+                            shared_data[net_base + 1 + li] = float(size)
+                            # Write this layer row in activations matrix
+                            row_off = act_base + li * NET_MAX_NODES
+                            for ni in range(size):
+                                shared_data[row_off + ni] = float(layer_vals[ni])
+                except Exception:
+                    # Ignore any errors in snapshotting the network
+                    pass
         else:
             time.sleep(0.0001)
 
@@ -192,6 +266,11 @@ def read_cat_data(shared_data: Array, cat_idx: int) -> dict:
         'muscle_energies': [],
         'distance': shared_data[offset + 131],
         'speed': shared_data[offset + 132],
+        'net': {
+            'layer_count': 0,
+            'sizes': [],
+            'values': [],  # list of layers, each a list of floats
+        }
     }
 
     # Body vertices (4 vertices)
@@ -231,6 +310,24 @@ def read_cat_data(shared_data: Array, cat_idx: int) -> dict:
     for _ in range(8):
         data['muscle_energies'].append(shared_data[idx])
         idx += 1
+
+    # Network snapshot
+    net_base = offset + 133
+    L = int(shared_data[net_base + 0])
+    L = max(0, min(L, NET_MAX_LAYERS))
+    sizes: List[int] = []
+    act_base = net_base + 1 + NET_MAX_LAYERS
+    values: List[list] = []
+    for li in range(L):
+        size = int(shared_data[net_base + 1 + li])
+        size = max(0, min(size, NET_MAX_NODES))
+        sizes.append(size)
+        row_off = act_base + li * NET_MAX_NODES
+        layer_vals = [shared_data[row_off + ni] for ni in range(size)]
+        values.append(layer_vals)
+    data['net']['layer_count'] = L
+    data['net']['sizes'] = sizes
+    data['net']['values'] = values
 
     return data
 
@@ -412,6 +509,81 @@ def draw_parallel_info(surface):
         y_offset += 15
 
 
+def draw_network_panel(surface, net: dict, x: int, y: int, width: int = 360, height: int = 260):
+    """Draw a small network visualization: layers and node activations."""
+    # Panel
+    panel_rect = pygame.Rect(x, y, width, height)
+    pygame.draw.rect(surface, PANEL_BG_COLOR, panel_rect, border_radius=8)
+    pygame.draw.rect(surface, SLIDER_BORDER_COLOR, panel_rect, 2, border_radius=8)
+
+    L = net.get('layer_count', 0) or 0
+    sizes: List[int] = net.get('sizes', [])
+    values: List[List[float]] = net.get('values', [])
+    if L == 0 or not sizes:
+        font = pygame.font.SysFont('Arial', 14)
+        surface.blit(font.render("Network: n/a", True, (220, 220, 220)), (x + 12, y + 12))
+        return
+
+    # Layout
+    left_pad = x + 12
+    top_pad = y + 30
+    right_pad = x + width - 12
+    bottom_pad = y + height - 12
+
+    col_spacing = 0 if L <= 1 else (right_pad - left_pad) / (L - 1)
+    max_nodes = max(1, max(sizes) if sizes else 1)
+    node_radius = max(4, min(10, int(140 / max(1, max_nodes))))
+
+    font = pygame.font.SysFont('Arial', 12)
+    title = font.render("Best NN (layers × nodes)", True, (220, 220, 220))
+    surface.blit(title, (x + 12, y + 8))
+
+    # Draw nodes per layer
+    for li in range(L):
+        cx = int(left_pad + li * col_spacing)
+        size = sizes[li] if li < len(sizes) else 0
+        lay_vals = values[li] if li < len(values) else []
+        # Vertical spacing
+        if size <= 1:
+            ys = [int((top_pad + bottom_pad) / 2)]
+        else:
+            span = (bottom_pad - top_pad)
+            step = span / (size - 1)
+            ys = [int(top_pad + k * step) for k in range(size)]
+        for ni in range(size):
+            v = lay_vals[ni] if ni < len(lay_vals) else 0.0
+            # Color map from value in [-1,1]: blue negative, white zero, red positive
+            t = max(-1.0, min(1.0, float(v)))
+            if t >= 0:
+                r = int(100 + 155 * t)
+                g = int(100 + 55 * (1 - t))
+                b = 120
+            else:
+                t2 = -t
+                r = 120
+                g = int(100 + 55 * (1 - t2))
+                b = int(100 + 155 * t2)
+            color = (r, g, b)
+            pygame.draw.circle(surface, color, (cx, ys[ni]), node_radius)
+            pygame.draw.circle(surface, (30, 30, 30), (cx, ys[ni]), node_radius, 1)
+            # value text
+            txt = font.render(f"{v:.2f}", True, (230, 230, 230))
+            surface.blit(txt, (cx + node_radius + 4, ys[ni] - 7))
+
+
+# Minimal always-visible HUD for generation/time when UI is hidden
+def draw_mini_iteration_hud(surface, iteration: int, time_elapsed: float, max_time: float):
+    # Small text at top-left with subtle shadow for readability
+    font = pygame.font.SysFont('Arial', 16, bold=True)
+    text = f"Gen {iteration}  |  {time_elapsed:.1f} / {max_time:.0f}s"
+    # Shadow
+    shadow_surf = font.render(text, True, (0, 0, 0))
+    surface.blit(shadow_surf, (11, 11))
+    # Main text
+    text_surf = font.render(text, True, (255, 255, 255))
+    surface.blit(text_surf, (10, 10))
+
+
 def main():
     mp.set_start_method('spawn', force=True)
 
@@ -422,6 +594,12 @@ def main():
 
     spawn_x, ground_y = 10.0, 5.0
 
+    # UI toggle: allow disabling all UI overlays to improve render/simulation speed
+    # Environment variables:
+    #   DISABLE_UI=1 -> start with UI hidden
+    #   SHOW_UI=0    -> start with UI hidden (alternative)
+    show_ui = not (os.getenv('DISABLE_UI', '0') == '1' or os.getenv('SHOW_UI', '1') == '0')
+
     # Shared memory for all cats
     shared_data = Array(ctypes.c_double, NUM_CATS * CAT_DATA_SIZE)
     running_flag = Value(ctypes.c_int, 1)
@@ -429,10 +607,13 @@ def main():
 
     # Start workers
     workers = []
+    genomes_queues: List[Queue] = []
     for core_id in range(NUM_CORES):
+        gq = mp.Queue(maxsize=2)
+        genomes_queues.append(gq)
         worker = Process(
             target=simulation_worker,
-            args=(core_id, CATS_PER_CORE, shared_data, running_flag, reset_flags[core_id], spawn_x, ground_y)
+            args=(core_id, CATS_PER_CORE, shared_data, running_flag, reset_flags[core_id], spawn_x, ground_y, gq)
         )
         worker.start()
         workers.append(worker)
@@ -446,6 +627,24 @@ def main():
     iteration_time = 0.0
     running = True
 
+    # GA state (initialized lazy when we know num_muscles from first read)
+    ea: Optional[EvolutionaryAlgorithm] = None
+
+    def send_population_to_workers(population: List[Any]):
+        # Split population into per-core chunks and send to worker queues
+        for core_id in range(NUM_CORES):
+            start = core_id * CATS_PER_CORE
+            end = start + CATS_PER_CORE
+            chunk = population[start:end]
+            try:
+                # Clear any stale items
+                while True:
+                    genomes_queues[core_id].get_nowait()
+            except _queue.Empty:
+                pass
+            genomes_queues[core_id].put(chunk)
+            reset_flags[core_id].value = 1
+
     while running:
         dt = 1.0 / TARGET_FPS
 
@@ -455,6 +654,9 @@ def main():
             elif event.type == pygame.KEYDOWN:
                 if event.key == pygame.K_ESCAPE:
                     running = False
+                # Toggle UI overlays (graphs, texts, panels, grass, ruler, flag)
+                elif event.key == pygame.K_u:
+                    show_ui = not show_ui
                 elif event.key == pygame.K_r:
                     iteration_time = 0.0
                     for flag in reset_flags:
@@ -466,6 +668,16 @@ def main():
 
         # Read all cat data
         all_cats = [read_cat_data(shared_data, i) for i in range(NUM_CATS)]
+
+        # Lazy GA init once we know number of muscles
+        if ea is None:
+            try:
+                num_muscles = len(all_cats[0]['muscle_data']) if NUM_CATS > 0 else 8
+                ea = EvolutionaryAlgorithm(input_size=num_muscles, output_size=num_muscles, pop_size=NUM_CATS)
+                # Send initial random population to workers
+                send_population_to_workers([g.clone() for g in ea.population])
+            except Exception:
+                pass
 
         # Find best cat
         best_idx = max(range(NUM_CATS), key=lambda i: all_cats[i]['distance'])
@@ -485,10 +697,26 @@ def main():
 
         # Check iteration end
         if iteration_time >= ITERATION_TIME:
+            # Evaluate population fitness from distances/speeds
+            if ea is not None:
+                for i in range(NUM_CATS):
+                    d = all_cats[i]['distance']
+                    s = all_cats[i]['speed']
+                    ea.fitness[i] = fitness_distance_speed(d, s)
+                # Save best every 20 generations
+                if iteration % 3 == 0:
+                    try:
+                        ea._save_best(iteration)
+                    except Exception:
+                        pass
+                # Reproduce next generation
+                parents = ea.select_parents()
+                ea.population = ea.reproduce(parents)
+                # Push new genomes to workers and reset worlds
+                send_population_to_workers([g.clone() for g in ea.population])
+
             iteration += 1
             iteration_time = 0.0
-            for flag in reset_flags:
-                flag.value = 1
             for h in force_histories:
                 h.clear()
 
@@ -497,20 +725,32 @@ def main():
         ground_screen_y = SCREEN_HEIGHT - ground_y * PPM
         pygame.draw.rect(screen, GROUND_COLOR, (0, ground_screen_y, SCREEN_WIDTH, SCREEN_HEIGHT - ground_screen_y))
 
-        draw_grass(screen, camera_x, ground_y)
-        draw_ruler(screen, camera_x, ground_y)
-        draw_flag(screen, spawn_x, camera_x, ground_y)
+        # Optional world cosmetics and UI overlays
+        if show_ui:
+            draw_grass(screen, camera_x, ground_y)
+            draw_ruler(screen, camera_x, ground_y)
+            draw_flag(screen, spawn_x, camera_x, ground_y)
 
+        # Always draw simulated entities (cats); UI toggle affects only overlays
         for i, cat_data in enumerate(all_cats):
             draw_cat_from_render_data(screen, cat_data, camera_x)
 
-        draw_iteration_info(screen, iteration, iteration_time, ITERATION_TIME)
-        draw_parallel_info(screen)
+        # Always show small HUD with generation/time
+        draw_mini_iteration_hud(screen, iteration, iteration_time, ITERATION_TIME)
 
-        total_power = sum(m['activation'] * 1000 for m in best_cat['muscle_data'])
-        draw_best_cat_info(screen, best_cat['distance'], best_cat['speed'], total_power)
-        draw_muscle_energy_sliders(screen, best_cat['muscle_energies'], SCREEN_WIDTH - 260, 20)
-        draw_force_graph(screen, force_histories, SCREEN_WIDTH - 270, 200, force_max_samples)
+        if show_ui:
+            draw_iteration_info(screen, iteration, iteration_time, ITERATION_TIME)
+            draw_parallel_info(screen)
+
+            total_power = sum(m['activation'] * 1000 for m in best_cat['muscle_data'])
+            draw_best_cat_info(screen, best_cat['distance'], best_cat['speed'], total_power)
+            draw_muscle_energy_sliders(screen, best_cat['muscle_energies'], SCREEN_WIDTH - 260, 20)
+            draw_force_graph(screen, force_histories, SCREEN_WIDTH - 270, 200, force_max_samples)
+            # Draw best network visualization panel
+            draw_network_panel(screen, best_cat.get('net', {}), SCREEN_WIDTH - 380, SCREEN_HEIGHT - 280, 360, 260)
+        else:
+            # Show minimal generation/time HUD even when UI is hidden
+            draw_mini_iteration_hud(screen, iteration, iteration_time, ITERATION_TIME)
 
         pygame.display.flip()
         clock.tick(TARGET_FPS)

@@ -23,4 +23,4 @@ class LegExtensionTestController(NeuralNetworkInterface):
             List of 0.0 activations for all muscles
         """
         # Deactivate all muscles - legs will extend under gravity
-        return [-1.0] * self.num_muscles
+        return [1.0] * self.num_muscles

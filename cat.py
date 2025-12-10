@@ -138,6 +138,9 @@ class NeuralNetworkInterface:
             muscle_state = {
                 'energy_percent': muscle.get_energy_percent(),
                 'activation': muscle.activation,
+                # Provide stretch ratio for controllers that rely on muscle length feedback
+                # stretch ~ 1.0 at rest; >1.0 extended; <1.0 compressed
+                'stretch': muscle.get_stretch_ratio(),
             }
             state['muscles'].append(muscle_state)
 
@@ -525,8 +528,8 @@ class Cat:
             body_b=upper,
             local_anchor_a=(0, 0),  # Point on torso near this leg's hip
             local_anchor_b=(-x_off, -self.upper_len * 0.3),  # Lower part of upper leg
-            max_force=80.0 * self.scale,
-            max_energy=100.0,
+            max_force=240.0 * self.scale,
+            max_energy=10.0,
             energy_regen_rate=20.0,
             energy_cost_factor=0.03,
             rest_length= math.sqrt(-x_off ** 2 + (-self.upper_len * 0.3) ** 2) * 0.8,
@@ -541,8 +544,8 @@ class Cat:
             body_b=lower,
             local_anchor_a=(x_off, self.upper_len * 0.1),  # Lower part of upper leg
             local_anchor_b=(x_off, -self.lower_len * 0.1),   # Upper part of lower leg
-            max_force=60.0 * self.scale,
-            max_energy=100.0,
+            max_force=180.0 * self.scale,
+            max_energy=10.0,
             energy_regen_rate=20.0,
             energy_cost_factor=0.03,
             rest_length= (self.upper_len * 0.1 + self.lower_len * 0.1) * 0.8,
